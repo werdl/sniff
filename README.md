@@ -1,5 +1,5 @@
 # sniff
-> A re-usable, logging and simple packet sniffer, written in Rust
+> A packet-collating, logging and simple packet sniffer, written in Rust
 ## Usage
 ```bash
 Usage: sniff [OPTIONS] [COMMAND]
