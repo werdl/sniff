@@ -22,3 +22,4 @@ Note: The program must be run as root to access the network interface.
 
 ## Notes
 - `sniff` only supports IPv4 packets, but should be OS-agnostic.
+- `libpnet` should be installed to run a pre-compiled executable, along with `libpnet-dev` for compiling said executable.
