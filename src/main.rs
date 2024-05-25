@@ -1,126 +1,63 @@
-use std::io::{Read, Seek, Write};
-use std::thread::current;
-use std::time::{SystemTime, UNIX_EPOCH};
+mod conf;
 
-use pnet::datalink;
-use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
-use pnet::packet::{Packet, PrimitiveValues};
-
-use clap::{self, Parser};
-
+use conf::{IpAddr, MacAddr, Protocol};
 use serde::{Deserialize, Serialize};
 
-// subcommands
-#[derive(Parser, Debug)]
-enum SubCommand {
-    /// Monitor only TCP packets
-    #[clap(name = "tcp")]
-    Tcp(Tcp),
+use std::{
+    io::{Read, Seek, Write},
+    time::SystemTime,
+};
 
-    /// Monitor only UDP packets
-    #[clap(name = "udp")]
-    Udp(Udp),
+use pnet::{
+    datalink,
+    packet::{Packet, PrimitiveValues},
+};
 
-    /// Monitor only ICMP packets
-    #[clap(name = "icmp")]
-    Icmp(Icmp),
-
-    /// Monitor packets from a previously written log file
-    #[clap(name = "file")]
-    FromFile(FromFile),
-}
-
-// tcp subcommand
-#[derive(Parser, Debug)]
-struct Tcp {
-    #[clap(short, long)]
-    port: u16,
-}
-
-// udp subcommand
-#[derive(Parser, Debug)]
-struct Udp {
-    #[clap(short, long)]
-    port: u16,
-}
-
-// icmp subcommand
-#[derive(Parser, Debug)]
-struct Icmp {
-    #[clap(short, long)]
-    message: String,
-}
-
-#[derive(Parser, Debug)]
-struct FromFile {
-    #[clap(short, long)]
-    file: String,
-
-    #[clap(short, long, default_value = "false")]
-    real_time_playback: bool,
-}
-
-// main command
-#[derive(Parser, Debug)]
-struct Args {
-    #[clap(subcommand)]
-    subcmd: Option<SubCommand>,
-
-    /// log to a file, off by default. Warning: this creates a HUGE amount of data in seconds
-    #[clap(short, long, default_value = "false")]
-    log: bool,
-
-    /// verbose output (eg MAC addresses, number of collated packets), off by default
-    #[clap(short, long, default_value = "false")]
-    verbose: bool,
-}
-
-// capture subcommand
 fn main() {
-    // Parse the command line arguments
-    let args: Args = Args::parse();
+    let config = conf::get_conf();
 
-    let protocol = match args.subcmd {
-        Some(SubCommand::Tcp(_)) => 6,
-        Some(SubCommand::Udp(_)) => 17,
-        Some(SubCommand::Icmp(_)) => 1,
-        Some(SubCommand::FromFile(options)) => {
-            let mut file = std::fs::OpenOptions::new()
-                .read(true)
-                .open(options.file.clone())
-                .unwrap();
+    // if we have to load from a file, do that in a seperate loop and then return
+    if config.load_from_file.is_some() {
+        // first, load all the packets from the file
+        let fname = config.clone().load_from_file.unwrap();
 
-            let mut contents = String::new();
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(fname)
+            .unwrap();
 
-            file.read_to_string(&mut contents).unwrap();
+        let mut data = String::new();
+        file.read_to_string(&mut data).unwrap();
 
-            let data: LogFile = serde_json::from_str(&contents).unwrap();
+        let logs: PacketLog = serde_json::from_str(&data).unwrap();
 
-            let mut last_time = 0.0;
+        let start_time = logs.start_time;
 
-            if options.real_time_playback {
-                let start_time = data.start_time;
-                for stats in data.data.iter() {
-                    let elapsed_time = stats.time.duration_since(start_time).unwrap();
-                    std::thread::sleep(
-                        elapsed_time - std::time::Duration::from_secs_f64(last_time as f64),
-                    );
+        // if real time playback is enabled, then we need to play back the packets in real time, by sleeping for the difference between the current time and the time of the packet
+        if config.real_time_playback {
+            let mut amount_slept = 0.0;
+            for packet in logs.packets.iter() {
+                let time_diff = packet.timestamp.duration_since(start_time).unwrap().as_secs_f32();
+                let time_diff = time_diff - amount_slept;
 
-                    last_time = elapsed_time.as_secs_f64();
+                std::thread::sleep(std::time::Duration::from_secs_f32(time_diff));
 
-                    print_stats(stats.clone(), Some(start_time), args.verbose);
-                }
-            } else {
-                for stats in data.data.iter() {
-                    print_stats(stats.clone(), Some(data.start_time), args.verbose);
-                }
+                print_request(packet.clone(), config.clone(), start_time);
+
+                amount_slept += time_diff;
             }
-
-            return;
+        } else {
+            for packet in logs.packets.iter() {
+                print_request(packet.clone(), config.clone(), start_time);
+            }
         }
-        None => 0,
-    };
 
+        return;
+    }
+
+    // now the main loop
     // Get the list of available network interfaces
     let interfaces = datalink::interfaces();
 
@@ -137,96 +74,88 @@ fn main() {
         Err(e) => panic!("Failed to create channel: {}", e),
     };
 
-    // Start capturing and decoding packets
-    let mut current_request = Vec::<IPv4Packet>::new();
+    let mut current_requests: Vec<ProcessedPacket> = Vec::new();
 
-    let unix_time = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-
-    let time = std::time::SystemTime::now();
-
-    // create file log-<unix_time>.json
-    if args.log {
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(format!("log-{}.json", unix_time))
-            .unwrap();
-
-        file.write_all("[]".as_bytes()).unwrap();
-    }
+    let start_time = SystemTime::now();
 
     loop {
         match rx.next() {
             Ok(packet) => {
-                // Decode the Ethernet packet
-                if let Some(ethernet) = EthernetPacket::new(packet) {
-                    // Check if the packet is an IP packet
-                    if ethernet.get_ethertype() == EtherTypes::Ipv4 {
-                        if ethernet.payload()[9] != protocol && protocol != 0 {
-                            continue;
+                // first, check if the origin ip and the dest ip are the same as the last packet
+
+                // if so, append to the current_requests and continue
+                // if not, process the current_requests and then clear it
+
+                let ether = pnet::packet::ethernet::EthernetPacket::new(&packet).unwrap();
+
+                let packet = ProcessedPacket {
+                    orig_mac: MacAddr::from(ether.get_source().to_primitive_values()),
+                    dest_mac: MacAddr::from(ether.get_destination().to_primitive_values()),
+                    protocol: Protocol::from(ether.payload()[9]),
+                    payload: ether.payload().to_vec(),
+                };
+
+                let orig_ip = if ether.get_ethertype() == pnet::packet::ethernet::EtherTypes::Ipv4 {
+                    let ip = pnet::packet::ipv4::Ipv4Packet::new(ether.payload()).unwrap();
+                    IpAddr::V4(ip.get_source().to_primitive_values().into())
+                } else {
+                    let ip = pnet::packet::ipv6::Ipv6Packet::new(ether.payload());
+
+                    if ip.is_none() {
+                        continue;
+                    }
+                    IpAddr::V6(ip.unwrap().get_source().to_primitive_values().into())
+                };
+
+                let dest_ip = if ether.get_ethertype() == pnet::packet::ethernet::EtherTypes::Ipv4 {
+                    let ip = pnet::packet::ipv4::Ipv4Packet::new(ether.payload()).unwrap();
+                    IpAddr::V4(ip.get_destination().to_primitive_values().into())
+                } else {
+                    let ip = pnet::packet::ipv6::Ipv6Packet::new(ether.payload()).unwrap();
+                    IpAddr::V6(ip.get_destination().to_primitive_values().into())
+                };
+
+                if current_requests.len() == 0 {
+                    current_requests.push(packet);
+                    continue;
+                } else {
+                    let last_packet = current_requests.last().unwrap();
+
+                    if last_packet.orig_mac == packet.orig_mac
+                        && last_packet.dest_mac == packet.dest_mac
+                    {
+                        current_requests.push(packet);
+                        continue;
+                    } else {
+                        // process the current_requests
+                        let mut total_bytes = 0;
+                        let mut total_packets = 0;
+
+                        for req in current_requests.iter() {
+                            total_bytes += req.payload.len();
+                            total_packets += 1;
                         }
 
-                        // check that from and to are the same - if they are, append and continue, if not, print the data for the current_request and then clear it
-                        if (current_request.len() != 0
-                            && current_request.last().unwrap().origin
-                                == ethernet.get_source().to_primitive_values()
-                            && current_request.last().unwrap().dest
-                                == ethernet.get_destination().to_primitive_values())
-                            || current_request.len() == 0
-                        {
-                            let ip_packet = ethernet.payload();
-                            let dest = ip_packet[16..20].to_vec();
-                            let origin = ip_packet[12..16].to_vec();
-                            let protocol = ip_packet[9];
-                            let data = ip_packet[20..].to_vec();
+                        let stats = RequestStats {
+                            protocol: current_requests[0].protocol,
+                            orig_ip: orig_ip,
+                            orig_mac: current_requests[0].orig_mac,
+                            dest_ip: dest_ip,
+                            dest_mac: current_requests[0].dest_mac,
+                            bytes: total_bytes as u64,
+                            packets: total_packets as u64,
+                            timestamp: SystemTime::now(),
+                            raw: current_requests
+                                .iter()
+                                .map(|x| x.payload.clone())
+                                .flatten()
+                                .collect(),
+                        };
 
-                            current_request.push(IPv4Packet {
-                                dest_ip: dest,
-                                orig_ip: origin,
-                                protocol: protocol,
-                                data: data,
-                                origin: ethernet.get_source().to_primitive_values(),
-                                dest: ethernet.get_destination().to_primitive_values(),
-                            });
-                        } else {
-                            if current_request.len() != 0 {
-                                let mut total_size = 0;
-                                for packet in current_request.iter() {
-                                    total_size += packet.data.len();
-                                }
+                        print_request(stats, config.clone(), start_time);
 
-                                let stats = RequestStats {
-                                    packets: current_request.clone(),
-                                    time: SystemTime::now(),
-                                    total_size: total_size,
-                                };
-
-                                print_stats(stats.clone(), Some(time), args.verbose);
-
-                                if args.log {
-                                    write_log(stats, Some(format!("log-{}.json", unix_time)), time);
-                                }
-
-                                current_request.clear();
-                            }
-                            let ip_packet = ethernet.payload();
-                            let dest = ip_packet[16..20].to_vec();
-                            let origin = ip_packet[12..16].to_vec();
-                            let protocol = ip_packet[9];
-                            let data = ip_packet[20..].to_vec();
-
-                            current_request.push(IPv4Packet {
-                                dest_ip: dest,
-                                orig_ip: origin,
-                                protocol: protocol,
-                                data: data,
-                                origin: ethernet.get_source().to_primitive_values(),
-                                dest: ethernet.get_destination().to_primitive_values(),
-                            });
-                        }
+                        current_requests.clear();
+                        current_requests.push(packet);
                     }
                 }
             }
@@ -235,132 +164,161 @@ fn main() {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-struct IPv4Packet {
-    dest: (u8, u8, u8, u8, u8, u8),
-    origin: (u8, u8, u8, u8, u8, u8),
-    protocol: u8,
-    data: Vec<u8>,
-
-    orig_ip: Vec<u8>,
-    dest_ip: Vec<u8>,
+#[derive(Clone)]
+struct ProcessedPacket {
+    orig_mac: MacAddr,
+    dest_mac: MacAddr,
+    protocol: Protocol,
+    payload: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 struct RequestStats {
-    packets: Vec<IPv4Packet>,
-    time: std::time::SystemTime,
-    total_size: usize,
+    protocol: Protocol,
+    orig_ip: IpAddr,
+    orig_mac: MacAddr,
+    dest_ip: IpAddr,
+    dest_mac: MacAddr,
+
+    bytes: u64,
+    packets: u64,
+
+    timestamp: SystemTime,
+
+    raw: Vec<u8>, // the raw packet data, but with the headers stripped, leaving just the payload
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-struct LogFile {
-    data: Vec<RequestStats>,
-    start_time: std::time::SystemTime,
+fn print_request(stats: RequestStats, config: conf::Config, start_time: SystemTime) {
+    // start time is when the program started (ie. when the user pressed enter)
+
+    if config.clone().log_file.is_some() {
+        log_to_file(
+            stats.clone(),
+            config.clone().log_file.unwrap(),
+            start_time,
+        );
+    }
+
+    if config.protocol.is_some() {
+        let protocol = config.clone().protocol.unwrap();
+        if stats.protocol != protocol {
+            return;
+        }
+    }
+
+    // first, check if we should be printing this request: check exclude/include filters
+    if config.exclude_ips.is_some() {
+        let exclude_ips = config.clone().exclude_ips.unwrap();
+        if exclude_ips.contains(&stats.orig_ip) || exclude_ips.contains(&stats.dest_ip) {
+            return;
+        }
+    }
+    if config.exclude_macs.is_some() {
+        let exclude_macs = config.clone().exclude_macs.unwrap();
+        if exclude_macs.contains(&stats.orig_mac) || exclude_macs.contains(&stats.dest_mac) {
+            return;
+        }
+    }
+
+    if config.filter_ips.is_some() {
+        let include_ips = config.clone().filter_ips.unwrap();
+        if !include_ips.contains(&stats.orig_ip) && !include_ips.contains(&stats.dest_ip) {
+            return;
+        }
+    }
+
+    if config.filter_macs.is_some() {
+        let include_macs = config.clone().filter_macs.unwrap();
+        if !include_macs.contains(&stats.orig_mac) && !include_macs.contains(&stats.dest_mac) {
+            return;
+        }
+    }
+
+    if config.highlight_macs.is_some() {
+        let highlight_macs = config.clone().highlight_macs.unwrap();
+        if highlight_macs.contains(&stats.orig_mac) || highlight_macs.contains(&stats.dest_mac) {
+            print!("\x1b[1;31m"); // red
+        } else {
+            print!("\x1b[0m");
+        }
+    } else if config.highlight_ips.is_some() {
+        let highlight_ips = config.clone().highlight_ips.unwrap();
+        if highlight_ips.contains(&stats.orig_ip) || highlight_ips.contains(&stats.dest_ip) {
+            print!("\x1b[1;31m"); // red
+        } else {
+            print!("\x1b[0m");
+        }
+    } else {
+        print!("\x1b[0m");
+    }
+
+    // print the stats
+    if config.verbose {
+        println!(
+            "{} ({} packet{}) at {:02}s: {} ({}) -> {} ({}) {}B",
+            stats.protocol,
+            stats.packets,
+            if stats.packets == 1 { "" } else { "s" },
+            stats
+                .timestamp
+                .duration_since(start_time)
+                .unwrap()
+                .as_secs_f32(),
+            stats.orig_ip,
+            stats.orig_mac,
+            stats.dest_ip,
+            stats.dest_mac,
+            stats.bytes,
+        );
+    } else {
+        println!(
+            "{} at {:.2}s: {} -> {}: {} bytes",
+            stats.protocol,
+            stats
+                .timestamp
+                .duration_since(start_time)
+                .unwrap()
+                .as_secs_f32(),
+            stats.orig_ip,
+            stats.dest_ip,
+            stats.bytes,
+        );
+    }
 }
 
-fn fmt_mac(mac: (u8, u8, u8, u8, u8, u8)) -> String {
-    format!(
-        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        mac.0, mac.1, mac.2, mac.3, mac.4, mac.5
-    )
+#[derive(Serialize, Deserialize)]
+struct PacketLog {
+    packets: Vec<RequestStats>,
+    start_time: SystemTime,
 }
 
-fn write_log(stats: RequestStats, fname: Option<String>, s_time: std::time::SystemTime) {
-    // read the current file's list, append the new data, and write it back
+fn log_to_file(stats: RequestStats, fname: String, start_time: SystemTime) {
+    // first, load any existing data from the file
+    // then, append the new data
+    // then, write the new data to the file
 
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(fname.unwrap())
+        .create(true)
+        .open(fname)
         .unwrap();
 
-    let mut contents = String::new();
+    let mut data = String::new();
+    file.read_to_string(&mut data).unwrap();
 
-    file.read_to_string(&mut contents).unwrap();
-
-    let mut data: LogFile = serde_json::from_str(&contents).unwrap_or(LogFile {
-        data: Vec::new(),
-        start_time: s_time,
+    let mut logs: PacketLog = serde_json::from_str(&data).unwrap_or(PacketLog {
+        packets: Vec::new(),
+        start_time: start_time,
     });
 
-    data.data.push(stats);
+    logs.packets.push(stats);
 
-    let to_write = LogFile {
-        data: data.data,
-        start_time: s_time,
-    };
+    let new_data = serde_json::to_string(&logs).unwrap();
 
+    // seek to the beginning of the file
     file.seek(std::io::SeekFrom::Start(0)).unwrap();
 
-    file.write_all(serde_json::to_string(&to_write).unwrap().as_bytes())
-        .unwrap();
-
-    file.set_len(serde_json::to_string(&to_write).unwrap().len() as u64)
-        .unwrap();
-
-    file.flush().unwrap();
+    // write the new data
+    file.write_all(new_data.as_bytes()).unwrap();
 }
-
-fn print_stats(stats: RequestStats, s_time: Option<std::time::SystemTime>, verbose: bool) {
-    if verbose {
-        println!(
-            "{} IPv4 {} packet{} at {:.2}s: {} ({}) -> {} ({}) : {} bytes",
-            stats.packets.len(),
-            match stats.packets.last().unwrap().protocol {
-                1 => "ICMP",
-                6 => "TCP",
-                17 => "UDP",
-                _ => "Unknown",
-            },
-            if stats.packets.len() > 1 { "s" } else { "" },
-            match s_time {
-                Some(time) => stats.time.duration_since(time).unwrap().as_secs_f64(),
-                None => stats.time.elapsed().unwrap().as_secs_f64(),
-            },
-            stats
-                .packets
-                .last()
-                .unwrap()
-                .orig_ip
-                .iter()
-                .map(|x| format!("{}", x))
-                .collect::<Vec<String>>()
-                .join("."),
-            fmt_mac(stats.packets.last().unwrap().origin),
-            stats
-                .packets
-                .last()
-                .unwrap()
-                .dest_ip
-                .iter()
-                .map(|x| format!("{}", x))
-                .collect::<Vec<String>>()
-                .join("."),
-            fmt_mac(stats.packets.last().unwrap().dest),
-            stats.total_size,
-        );
-    } else {
-        println!(
-            "{} at {:.2}s: {} -> {} : {} bytes",
-            match stats.packets.last().unwrap().protocol {
-                1 => "ICMP",
-                6 => "TCP",
-                17 => "UDP",
-                _ => "Unknown",
-            },
-            match s_time {
-                Some(time) => stats.time.duration_since(time).unwrap().as_secs_f64(),
-                None => stats.time.elapsed().unwrap().as_secs_f64(),
-            },
-            stats.packets.last().unwrap().orig_ip.iter().map(|x| format!("{}", x)).collect::<Vec<String>>().join("."),
-            stats.packets.last().unwrap().dest_ip.iter().map(|x| format!("{}", x)).collect::<Vec<String>>().join("."),
-            
-            stats.total_size,
-        );
-    
-    }
-}
-
-// next up: ipv6
-// this would entail creating a more unified interface for packets, seperating the payload into IP address and similar metadata, and then a seperate payload for the actual data, which wouldn't differ between ipv4 and ipv6

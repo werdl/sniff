@@ -2,20 +2,34 @@
 > A packet-collating, logging and simple packet sniffer, written in Rust
 ## Usage
 ```bash
-Usage: sniff [OPTIONS] [COMMAND]
+Usage: sniff [OPTIONS] <PROTOCOL>
 
-Commands:
-  tcp   Monitor only TCP packets
-  udp   Monitor only UDP packets
-  icmp  Monitor only ICMP packets
-  file  Monitor packets from a previously written log file
-  help  Print this message or the help of the given subcommand(s)
-(will default to monitoring all packets if no command is given)
+Arguments:
+  <PROTOCOL>  Protocol to filter (note that this is either TCP, UDP, or ICMP, not application layer protocols)
 
 Options:
-  -l, --log      log to a file, off by default. Warning: this creates a HUGE amount of data in seconds
-  -v, --verbose  verbose output (eg MAC addresses, number of collated packets), off by default
-  -h, --help     Print
+  -v, --verbose
+          Verbose mode - prints MAC addresses
+  -l, --log-file <LOG_FILE>
+          Path to the log file, if not provided, the program will not log
+  -X, --exclude-ips <EXCLUDE_IPS>
+          Exclude IP addresses from the output
+  -x, --exclude-macs <EXCLUDE_MACS>
+          Exclude MAC addresses from the output
+  -F, --filter-ips <FILTER_IPS>
+          Filter IP addresses
+  -f, --filter-macs <FILTER_MACS>
+          Filter MAC addresses
+  -I, --highlight-ips <HIGHLIGHT_IPS>
+          Highlight IP addresses
+  -i, --highlight-macs <HIGHLIGHT_MACS>
+          Highlight MAC addresses
+  -L, --load-from-file <LOAD_FROM_FILE>
+          Load from a previously saved log file
+  -r, --real-time-playback
+          Real-time playback from the log file
+  -h, --help
+          Print help
 ```
 
 Note: The program must be run as root to access the network interface.
