@@ -1,6 +1,6 @@
 mod conf;
 
-use conf::{IpAddr, MacAddr, Protocol};
+use conf::{IpAddr, IpAddrOrHostname, MacAddr, Protocol};
 use serde::{Deserialize, Serialize};
 
 use std::{
@@ -39,7 +39,11 @@ fn main() {
         if config.real_time_playback {
             let mut amount_slept = 0.0;
             for packet in logs.packets.iter() {
-                let time_diff = packet.timestamp.duration_since(start_time).unwrap().as_secs_f32();
+                let time_diff = packet
+                    .timestamp
+                    .duration_since(start_time)
+                    .unwrap()
+                    .as_secs_f32();
                 let time_diff = time_diff - amount_slept;
 
                 std::thread::sleep(std::time::Duration::from_secs_f32(time_diff));
@@ -189,15 +193,6 @@ struct RequestStats {
 }
 
 fn print_request(stats: RequestStats, config: conf::Config, start_time: SystemTime) {
-    // start time is when the program started (ie. when the user pressed enter)
-
-    if config.clone().log_file.is_some() {
-        log_to_file(
-            stats.clone(),
-            config.clone().log_file.unwrap(),
-            start_time,
-        );
-    }
 
     if config.protocol.is_some() {
         let protocol = config.clone().protocol.unwrap();
@@ -206,10 +201,70 @@ fn print_request(stats: RequestStats, config: conf::Config, start_time: SystemTi
         }
     }
 
+    // start time is when the program started (ie. when the user pressed enter)
+
+    let mut orig_ip: String;
+
+    if config.hostnames {
+        orig_ip = {
+            let ip: std::net::IpAddr = match stats.clone().orig_ip {
+                IpAddr::V4(ip) => std::net::IpAddr::from(ip.octets),
+                IpAddr::V6(ip) => std::net::IpAddr::from(ip.octets),
+            };
+            dns_lookup::lookup_addr(&ip).unwrap_or(ip.to_string())
+        };
+    } else {
+        orig_ip = stats.orig_ip.to_string();
+    }
+
+    let mut dest_ip: String;
+
+    if config.hostnames {
+        dest_ip = {
+            let ip: std::net::IpAddr = match stats.clone().dest_ip {
+                IpAddr::V4(ip) => std::net::IpAddr::from(ip.octets),
+                IpAddr::V6(ip) => std::net::IpAddr::from(ip.octets),
+            };
+
+            dns_lookup::lookup_addr(&ip).unwrap_or(ip.to_string())
+        };
+    } else {
+        dest_ip = stats.dest_ip.to_string();
+    }
+
+
+    // now, remove all but the TLD from the hostname (the last two parts of the domain)
+    if stats.orig_ip.to_string() != orig_ip {
+        let orig_ip_splitted = orig_ip.split('.').collect::<Vec<&str>>();
+        orig_ip = match orig_ip_splitted.len() {
+            0 => stats.orig_ip.to_string(), // IPv6
+            1 => orig_ip_splitted[0].to_string(),
+            2 => orig_ip_splitted.join("."),
+            _ => orig_ip_splitted[orig_ip_splitted.len() - 2..].join("."),
+        };    
+    }
+    
+    if stats.dest_ip.to_string() != dest_ip {
+        let dest_ip_splitted = dest_ip.split('.').collect::<Vec<&str>>();
+        dest_ip = match dest_ip_splitted.len() {
+            0 => stats.dest_ip.to_string(), // IPv6
+            1 => dest_ip_splitted[0].to_string(),
+            2 => dest_ip_splitted.join("."),
+            _ => dest_ip_splitted[dest_ip_splitted.len() - 2..].join("."),
+        };
+    }
+
+
+
+    if config.clone().log_file.is_some() {
+        log_to_file(stats.clone(), config.clone().log_file.unwrap(), start_time);
+    }
+
+
     // first, check if we should be printing this request: check exclude/include filters
     if config.exclude_ips.is_some() {
         let exclude_ips = config.clone().exclude_ips.unwrap();
-        if exclude_ips.contains(&stats.orig_ip) || exclude_ips.contains(&stats.dest_ip) {
+        if exclude_ips.contains(&IpAddrOrHostname::Hostname(orig_ip.clone())) || exclude_ips.contains(&IpAddrOrHostname::Hostname(dest_ip.clone())) {
             return;
         }
     }
@@ -222,7 +277,7 @@ fn print_request(stats: RequestStats, config: conf::Config, start_time: SystemTi
 
     if config.filter_ips.is_some() {
         let include_ips = config.clone().filter_ips.unwrap();
-        if !include_ips.contains(&stats.orig_ip) && !include_ips.contains(&stats.dest_ip) {
+        if !include_ips.contains(&IpAddrOrHostname::Hostname(orig_ip.clone())) && !include_ips.contains(&IpAddrOrHostname::Hostname(dest_ip.clone())) {
             return;
         }
     }
@@ -234,6 +289,7 @@ fn print_request(stats: RequestStats, config: conf::Config, start_time: SystemTi
         }
     }
 
+
     if config.highlight_macs.is_some() {
         let highlight_macs = config.clone().highlight_macs.unwrap();
         if highlight_macs.contains(&stats.orig_mac) || highlight_macs.contains(&stats.dest_mac) {
@@ -243,7 +299,7 @@ fn print_request(stats: RequestStats, config: conf::Config, start_time: SystemTi
         }
     } else if config.highlight_ips.is_some() {
         let highlight_ips = config.clone().highlight_ips.unwrap();
-        if highlight_ips.contains(&stats.orig_ip) || highlight_ips.contains(&stats.dest_ip) {
+        if highlight_ips.contains(&IpAddrOrHostname::Hostname(orig_ip.clone())) || highlight_ips.contains(&IpAddrOrHostname::Hostname(dest_ip.clone())) {
             print!("\x1b[1;31m"); // red
         } else {
             print!("\x1b[0m");
@@ -251,6 +307,8 @@ fn print_request(stats: RequestStats, config: conf::Config, start_time: SystemTi
     } else {
         print!("\x1b[0m");
     }
+
+
 
     // print the stats
     if config.verbose {
@@ -264,9 +322,9 @@ fn print_request(stats: RequestStats, config: conf::Config, start_time: SystemTi
                 .duration_since(start_time)
                 .unwrap()
                 .as_secs_f32(),
-            stats.orig_ip,
+            orig_ip,
             stats.orig_mac,
-            stats.dest_ip,
+            dest_ip,
             stats.dest_mac,
             stats.bytes,
         );
@@ -279,8 +337,8 @@ fn print_request(stats: RequestStats, config: conf::Config, start_time: SystemTi
                 .duration_since(start_time)
                 .unwrap()
                 .as_secs_f32(),
-            stats.orig_ip,
-            stats.dest_ip,
+            orig_ip,
+            dest_ip,
             stats.bytes,
         );
     }

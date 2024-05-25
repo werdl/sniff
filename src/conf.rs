@@ -7,12 +7,12 @@ use std::io::{Error, ErrorKind};
 
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct IpV4 {
-    octets: [u8; 4],
+    pub octets: [u8; 4],
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct IpV6 {
-    octets: [u8; 16],
+    pub octets: [u8; 16],
 }
 
 impl From<[u8; 4]> for IpV4 {
@@ -296,18 +296,35 @@ impl FromStr for Protocol {
 pub struct Config {
     pub verbose: bool,
     pub log_file: Option<String>,
-    pub exclude_ips: Option<Vec<IpAddr>>,
+    pub exclude_ips: Option<Vec<IpAddrOrHostname>>,
     pub exclude_macs: Option<Vec<MacAddr>>,
-    pub filter_ips: Option<Vec<IpAddr>>,
+    pub filter_ips: Option<Vec<IpAddrOrHostname>>,
     pub filter_macs: Option<Vec<MacAddr>>,
 
-    pub highlight_ips: Option<Vec<IpAddr>>,
+    pub highlight_ips: Option<Vec<IpAddrOrHostname>>,
     pub highlight_macs: Option<Vec<MacAddr>>,
 
     pub protocol: Option<Protocol>,
 
     pub load_from_file: Option<String>,
     pub real_time_playback: bool,
+    pub hostnames: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub enum IpAddrOrHostname {
+    Ip(IpAddr),
+    Hostname(String),
+}
+
+impl From<&str> for IpAddrOrHostname {
+    fn from(s: &str) -> Self {
+        if s.contains(':') {
+            IpAddrOrHostname::Ip(s.parse().unwrap())
+        } else {
+            IpAddrOrHostname::Hostname(s.to_string())
+        }
+    }
 }
 
 const STYLES: Styles = Styles::styled()
@@ -330,7 +347,7 @@ struct Args {
 
     /// Exclude IP addresses from the output
     #[clap(short = 'X', long, value_delimiter = ',')]
-    exclude_ips: Option<Vec<IpAddr>>,
+    exclude_ips: Option<Vec<IpAddrOrHostname>>,
 
     /// Exclude MAC addresses from the output
     #[clap(short = 'x', long, value_delimiter = ',')]
@@ -338,7 +355,7 @@ struct Args {
 
     /// Filter IP addresses
     #[clap(short = 'F', long, value_delimiter = ',')]
-    filter_ips: Option<Vec<IpAddr>>,
+    filter_ips: Option<Vec<IpAddrOrHostname>>,
 
     /// Filter MAC addresses
     #[clap(short, long, value_delimiter = ',')]
@@ -346,7 +363,7 @@ struct Args {
 
     /// Highlight IP addresses
     #[clap(short = 'I', long, value_delimiter = ',')]
-    highlight_ips: Option<Vec<IpAddr>>,
+    highlight_ips: Option<Vec<IpAddrOrHostname>>,
 
     /// Highlight MAC addresses
     #[clap(short = 'i', long, value_delimiter = ',')]
@@ -362,6 +379,10 @@ struct Args {
     /// Real-time playback from the log file
     #[clap(short, long)]
     real_time_playback: bool,
+
+    /// Print hostnames instead of IP addresses
+    #[clap(short = 'H', long)]
+    hostnames: bool,
 }
 
 pub fn get_conf() -> Config {
@@ -382,6 +403,7 @@ pub fn get_conf() -> Config {
         },
         load_from_file: args.load_from_file,
         real_time_playback: args.real_time_playback,
+        hostnames: args.hostnames,
     }
 }
 
