@@ -295,6 +295,7 @@ impl FromStr for Protocol {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Config {
     pub verbose: bool,
+    pub debug: bool,
     pub log_file: Option<String>,
     pub exclude_ips: Option<Vec<IpAddrOrHostname>>,
     pub exclude_macs: Option<Vec<MacAddr>>,
@@ -309,6 +310,7 @@ pub struct Config {
     pub load_from_file: Option<String>,
     pub real_time_playback: bool,
     pub hostnames: bool,
+    pub dont_collate: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -383,15 +385,51 @@ struct Args {
     /// Print hostnames instead of IP addresses
     #[clap(short = 'H', long)]
     hostnames: bool,
+
+    /// suppress communications involving _gateway
+    #[clap(short = 'g', long)]
+    suppress_gateway: bool,
+
+    /// debug mode
+    #[clap(short, long)]
+    debug: bool,
+
+    /// packet collation
+    #[clap(short = 'D', long)]
+    dont_collate: bool,
 }
 
 pub fn get_conf() -> Config {
     let args: Args = Args::parse();
 
+    let exclude_ips = args.exclude_ips.clone();
+
+    let mut updated_ips;
+
+    // if suppress gateway is enabled, add _gateway and 192.168.1.254 to the exclude list
+    if args.suppress_gateway {
+        updated_ips = match exclude_ips {
+            Some(ips) => ips,
+            None => Vec::new(),
+        };
+
+        updated_ips.push(IpAddrOrHostname::Hostname("_gateway".to_string()));
+        updated_ips.push(IpAddrOrHostname::Ip(IpAddr::V4([192, 168, 1, 254].into())));
+    } else {
+        updated_ips = match exclude_ips {
+            Some(ips) => ips,
+            None => Vec::new(),
+        };
+    }
+
     Config {
         verbose: args.verbose,
+        debug: args.debug,
         log_file: args.log_file,
-        exclude_ips: args.exclude_ips,
+        exclude_ips: match updated_ips.len() {
+            0 => None,
+            _ => Some(updated_ips),
+        },
         exclude_macs: args.exclude_macs,
         filter_ips: args.filter_ips,
         filter_macs: args.filter_macs,
@@ -404,6 +442,7 @@ pub fn get_conf() -> Config {
         load_from_file: args.load_from_file,
         real_time_playback: args.real_time_playback,
         hostnames: args.hostnames,
+        dont_collate: args.dont_collate,
     }
 }
 

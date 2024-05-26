@@ -16,6 +16,10 @@ use pnet::{
 fn main() {
     let config = conf::get_conf();
 
+    if config.debug {
+        println!("{:#?}", config);
+    }
+
     // if we have to load from a file, do that in a seperate loop and then return
     if config.load_from_file.is_some() {
         // first, load all the packets from the file
@@ -85,6 +89,7 @@ fn main() {
     loop {
         match rx.next() {
             Ok(packet) => {
+
                 // first, check if the origin ip and the dest ip are the same as the last packet
 
                 // if so, append to the current_requests and continue
@@ -126,7 +131,7 @@ fn main() {
                     let last_packet = current_requests.last().unwrap();
 
                     if last_packet.orig_mac == packet.orig_mac
-                        && last_packet.dest_mac == packet.dest_mac
+                        && last_packet.dest_mac == packet.dest_mac && config.protocol != Some(Protocol::Icmp) && !config.dont_collate
                     {
                         current_requests.push(packet);
                         continue;
@@ -267,6 +272,10 @@ fn print_request(stats: RequestStats, config: conf::Config, start_time: SystemTi
         if exclude_ips.contains(&IpAddrOrHostname::Hostname(orig_ip.clone())) || exclude_ips.contains(&IpAddrOrHostname::Hostname(dest_ip.clone())) {
             return;
         }
+
+        if exclude_ips.contains(&IpAddrOrHostname::Ip(stats.clone().orig_ip)) || exclude_ips.contains(&IpAddrOrHostname::Ip(stats.dest_ip)) {
+            return;
+        }
     }
     if config.exclude_macs.is_some() {
         let exclude_macs = config.clone().exclude_macs.unwrap();
@@ -313,8 +322,12 @@ fn print_request(stats: RequestStats, config: conf::Config, start_time: SystemTi
     // print the stats
     if config.verbose {
         println!(
-            "{} ({} packet{}) at {:02}s: {} ({}) -> {} ({}) {}B",
+            "{} (IPv{}) ({} packet{}) at {:.2}s: {} ({}) -> {} ({}) {}B",
             stats.protocol,
+            match stats.orig_ip {
+                IpAddr::V4(_) => 4,
+                IpAddr::V6(_) => 6,
+            },
             stats.packets,
             if stats.packets == 1 { "" } else { "s" },
             stats
